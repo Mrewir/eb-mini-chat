@@ -1,19 +1,19 @@
 import os 
 from fastapi import FastAPI, WebSocket, Depends, HTTPException
 from starlette.websockets import WebSocketDisconnect
-from typing import List, Generator
+from typing import List, Generator, Dict
 from datetime import datetime
+import asyncio # <-- Gerekliydi, eklenmiştir.
 
-# --- SQLALCHEMY İMPORTLARI ---
+# --- SQLALCHEMY VE POSTGRESQL AYARLARI ---
 from sqlalchemy import create_engine, Column, Integer, String, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
-from sqlalchemy.sql import select # Veri çekmek için eklendi
+from sqlalchemy.sql import select 
 
-# Railway'den gelen veritabanı bağlantı URI'si
+# Ortam değişkenlerinden veritabanı bağlantısını al (Railway veya yerel SQLite)
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-# Engine ve Base tanımlama
 engine = create_engine(DATABASE_URL)
 Base = declarative_base()
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -27,10 +27,8 @@ class Message(Base):
     content = Column(String)
     timestamp = Column(DateTime, default=datetime.utcnow)
 
-# Veritabanını oluşturma veya mevcutsa kullanma
 Base.metadata.create_all(bind=engine)
 
-# Veritabanı oturumu almak için bir fonksiyon (FastAPI bağımlılığı)
 def get_db() -> Generator[Session, None, None]:
     db = SessionLocal()
     try:
@@ -38,78 +36,53 @@ def get_db() -> Generator[Session, None, None]:
     finally:
         db.close()
         
-# --- MESAJ KAYDETME MANTIĞI ---
+# --- YARDIMCI VERİTABANI VE YAYIN FONKSİYONLARI ---
 
 def save_message(db: Session, username: str, content: str):
-    """Gelen mesajı veritabanına kaydeder."""
+    """Gelen metin mesajını veritabanına kaydeder."""
     db_message = Message(username=username, content=content)
     db.add(db_message)
     db.commit()
     db.refresh(db_message)
     return db_message
+
+# Ses/Metin yayını için tüm aktif WebSocket bağlantıları
+CONNECTIONS: Dict[str, WebSocket] = {} # <-- CONNECTIONS tanımlandı!
+
+# Gelen ses verisini tüm aktif bağlantılara yayan fonksiyon
+async def broadcast_audio(audio_chunk: bytes, sender: str):
+    """Gelen ikili (binary) ses verisini, gönderen hariç tüm bağlı istemcilere yayınlar."""
     
+    # asyncio.gather ile eş zamanlı olarak tüm istemcilere gönder
+    await asyncio.gather(
+        *[
+            # Sadece gönderen olmayanlara ikili veriyi gönder
+            websocket.send_bytes(audio_chunk)
+            for user, websocket in CONNECTIONS.items()
+            if user != sender
+        ]
+    )
+
 # --- ANA FASTAPI UYGULAMASI ---
 app = FastAPI()
 
-# Bağlı olan tüm istemcileri (kullanıcıları) tutacağımız liste
-active_connections: List[WebSocket] = []
-
-# Gelen mesajı tüm aktif bağlantılara yayan fonksiyon
-async def broadcast_message(message: str, sender_socket: WebSocket = None):
-    # ... (Bu fonksiyonun içeriği değişmedi)
-    for connection in active_connections:
+# Gelen metin mesajını tüm aktif bağlantılara yayan fonksiyon (Sadece metin mesajları için)
+async def broadcast_message(message: str, sender: str):
+    # Sadece metin göndermek için kullanılır (Ses değil)
+    for user, websocket in CONNECTIONS.items():
         try:
-            if connection != sender_socket:
-                await connection.send_text(message)
+            if user != sender:
+                await websocket.send_text(message)
         except Exception as e:
             print(f"Mesaj gönderme hatası: {e}")
-            if connection in active_connections:
-                active_connections.remove(connection)
 
-@app.websocket("/ws/{username}")
-async def websocket_endpoint(websocket: WebSocket, username: str, db: Session = Depends(get_db)): # <-- Depends EKLENDİ
-    # 1. Bağlantı Kabul Ediliyor
-    await websocket.accept()
-    active_connections.append(websocket)
-
-    # Yeni bir kullanıcının bağlandığını tüm aktif kullanıcılara duyur
-    join_message = f"📢 Kullanıcı {username} sohbete katıldı!"
-    await broadcast_message(join_message, sender_socket=websocket)
-
-    try:
-        # Kullanıcı bağlantısı açık kaldığı sürece mesajları dinle
-        while True:
-            # İstemciden (client) gelen mesajı al
-            data = await websocket.receive_text()
-
-            # Yeni Mesajı Kaydet (YENİ EKLEME)
-            save_message(db, username, data) 
-
-            # Mesajı biçimlendir ve yay
-            message = f"[{username}]: {data}"
-            await broadcast_message(message, sender_socket=websocket)
-
-    except WebSocketDisconnect:
-        # 2. Bağlantı Kesildi
-        active_connections.remove(websocket)
-        leave_message = f"❌ Kullanıcı {username} sohbetten ayrıldı."
-        await broadcast_message(leave_message)
-
-    except Exception as e:
-        # Diğer hataları yakala
-        print(f"Hata oluştu: {e}")
-        if websocket in active_connections:
-            active_connections.remove(websocket)
-
-# --- Yeni Endpoint: Geçmiş Mesajları Çekme ---
-
+# Geçmiş mesajları çekme API'si (Client bu adresi kullanacak)
 @app.get("/messages", response_model=List[dict])
 def get_messages(db: Session = Depends(get_db)):
     """Uygulama açıldığında geçmiş mesajları çekmek için yeni API."""
     
-    messages = db.query(Message).order_by(Message.timestamp.asc()).all()
+    messages = db.query(Message).order_by(Message.timestamp.asc()).limit(50).all() # Sadece son 50 mesajı çek
     
-    # SQLAlchemy objelerini JSON'a çevirecek basit bir liste oluşturma
     message_list = [
         {
             "username": m.username, 
@@ -120,4 +93,54 @@ def get_messages(db: Session = Depends(get_db)):
     ]
     return message_list
 
-# --- Buraya kadar. ---
+@app.websocket("/ws/{username}")
+async def websocket_endpoint(websocket: WebSocket, username: str, db: Session = Depends(get_db)):
+    """
+    WebSocket bağlantısını yönetir ve gelen metin/ses verilerini işler.
+    """
+    await websocket.accept()
+    
+    # Bağlantıyı aktif listeye ekle
+    CONNECTIONS[username] = websocket
+    print(f"[BAĞLANTI] Kullanıcı '{username}' bağlandı. Toplam: {len(CONNECTIONS)}")
+    
+    try:
+        while True:
+            # Gelen veriyi bekler (FastAPI'da hem metin hem binary veri alabiliriz)
+            data = await websocket.receive()
+            
+            if data.get("text"):
+                # --- METİN MESAJI İŞLEME ---
+                message = data["text"]
+                
+                # 1. Mesajı veritabanına kaydet
+                save_message(db, username, message) 
+                
+                # 2. Mesajı biçimlendir ve yayınla
+                full_message = f"[{username}]: {message}"
+                await broadcast_message(full_message, username)
+                
+            elif data.get("bytes"):
+                # --- İKİLİ (SES) VERİSİ İŞLEME ---
+                audio_chunk = data["bytes"]
+                
+                # Ses verisini, gönderen kişi hariç diğer tüm kullanıcılara yayınla
+                await broadcast_audio(audio_chunk, username)
+                
+            # Eğer 'close' mesajı gelirse bağlantıyı sonlandır
+            if data.get("code") == 1000:
+                break
+                
+
+    except WebSocketDisconnect:
+        # 2. Bağlantı Kesildi
+        pass # Son durum temizliği aşağıda yapılır
+        
+    except Exception as e:
+        print(f"[HATA] {username} için beklenmedik hata: {e}")
+        
+    finally:
+        # Bağlantı kesildiğinde veya hata oluştuğunda listeden çıkar
+        if username in CONNECTIONS:
+            del CONNECTIONS[username]
+            print(f"[AYRILDI] Kullanıcı '{username}' ayrıldı. Kalan: {len(CONNECTIONS)}")
