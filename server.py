@@ -14,7 +14,13 @@ from sqlalchemy.sql import select
 # Ortam değişkenlerinden veritabanı bağlantısını al (Railway veya yerel SQLite)
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-engine = create_engine(DATABASE_URL)
+engine = create_engine(
+    DATABASE_URL, 
+    # Cloud ortamları için bağlantı stabilitesi sağlar (ÇOK KRİTİK)
+    pool_pre_ping=True, 
+    # Yerel test için SQLite fix'i (bunun kalması önemli)
+    connect_args={"check_same_thread": False} 
+)
 Base = declarative_base()
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
